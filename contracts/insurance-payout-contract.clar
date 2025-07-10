@@ -8,6 +8,8 @@
 (define-constant err-policy-expired (err u106))
 (define-constant err-already-claimed (err u107))
 (define-constant err-invalid-policy (err u108))
+(define-constant err-invalid-age (err u109))
+(define-constant err-invalid-duration (err u110))
 
 (define-map policies
   { policy-id: uint }
@@ -17,7 +19,9 @@
     coverage: uint,
     start-block: uint,
     end-block: uint,
-    active: bool
+    active: bool,
+    age: uint,
+    risk-score: uint
   }
 )
 
@@ -38,14 +42,17 @@
 (define-data-var next-claim-id uint u1)
 (define-data-var contract-balance uint u0)
 
-(define-public (create-policy (coverage uint) (duration-blocks uint))
+(define-public (create-policy (coverage uint) (duration-blocks uint) (age uint))
   (let (
     (policy-id (var-get next-policy-id))
-    (premium (/ coverage u10))
+    (risk-score (calculate-risk-score age coverage duration-blocks))
+    (premium (calculate-dynamic-premium coverage risk-score))
     (start-block stacks-block-height)
     (end-block (+ stacks-block-height duration-blocks))
   )
     (asserts! (> coverage u0) err-invalid-amount)
+    (asserts! (and (>= age u18) (<= age u100)) err-invalid-age)
+    (asserts! (and (>= duration-blocks u144) (<= duration-blocks u52560)) err-invalid-duration)
     (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
     (map-set policies
       { policy-id: policy-id }
@@ -55,7 +62,9 @@
         coverage: coverage,
         start-block: start-block,
         end-block: end-block,
-        active: true
+        active: true,
+        age: age,
+        risk-score: risk-score
       }
     )
     (var-set contract-balance (+ (var-get contract-balance) premium))
@@ -210,4 +219,45 @@
 
 (define-read-only (calculate-premium (coverage uint))
   (/ coverage u10)
+)
+
+(define-read-only (calculate-risk-score (age uint) (coverage uint) (duration-blocks uint))
+  (let (
+    (age-factor (if (<= age u25) u150
+                  (if (<= age u40) u100
+                    (if (<= age u60) u125
+                      u175))))
+    (coverage-factor (if (<= coverage u50000) u100
+                      (if (<= coverage u200000) u125
+                        u150)))
+    (duration-factor (if (<= duration-blocks u4380) u100
+                      (if (<= duration-blocks u17520) u110
+                        u125)))
+  )
+    (/ (+ (* age-factor coverage-factor) (* duration-factor u50)) u150)
+  )
+)
+
+(define-read-only (calculate-dynamic-premium (coverage uint) (risk-score uint))
+  (let (
+    (base-premium (/ coverage u20))
+    (risk-multiplier (+ u100 (/ (* risk-score u50) u100)))
+  )
+    (/ (* base-premium risk-multiplier) u100)
+  )
+)
+
+(define-read-only (get-policy-risk-score (policy-id uint))
+  (match (map-get? policies { policy-id: policy-id })
+    policy (some (get risk-score policy))
+    none
+  )
+)
+
+(define-read-only (estimate-premium (coverage uint) (age uint) (duration-blocks uint))
+  (let (
+    (risk-score (calculate-risk-score age coverage duration-blocks))
+  )
+    (calculate-dynamic-premium coverage risk-score)
+  )
 )
