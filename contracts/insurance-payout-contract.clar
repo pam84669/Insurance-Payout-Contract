@@ -10,6 +10,8 @@
 (define-constant err-invalid-policy (err u108))
 (define-constant err-invalid-age (err u109))
 (define-constant err-invalid-duration (err u110))
+(define-constant err-policy-not-renewable (err u111))
+(define-constant err-renewal-too-early (err u112))
 
 (define-map policies
   { policy-id: uint }
@@ -21,7 +23,9 @@
     end-block: uint,
     active: bool,
     age: uint,
-    risk-score: uint
+    risk-score: uint,
+    renewable: bool,
+    renewal-count: uint
   }
 )
 
@@ -64,7 +68,9 @@
         end-block: end-block,
         active: true,
         age: age,
-        risk-score: risk-score
+        risk-score: risk-score,
+        renewable: true,
+        renewal-count: u0
       }
     )
     (var-set contract-balance (+ (var-get contract-balance) premium))
@@ -149,7 +155,7 @@
     )
     (map-set policies
       { policy-id: (get policy-id claim) }
-      (merge policy { active: false })
+      (merge policy { active: false, renewable: false })
     )
     (var-set contract-balance (- (var-get contract-balance) payout-amount))
     (ok payout-amount)
@@ -167,7 +173,7 @@
     (try! (as-contract (stx-transfer? refund-amount tx-sender (get holder policy))))
     (map-set policies
       { policy-id: policy-id }
-      (merge policy { active: false })
+      (merge policy { active: false, renewable: false })
     )
     (var-set contract-balance (- (var-get contract-balance) refund-amount))
     (ok refund-amount)
@@ -259,5 +265,84 @@
     (risk-score (calculate-risk-score age coverage duration-blocks))
   )
     (calculate-dynamic-premium coverage risk-score)
+  )
+)
+
+(define-public (renew-policy (policy-id uint) (extension-blocks uint))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (current-age (+ (get age policy) (/ (- stacks-block-height (get start-block policy)) u52560)))
+    (renewal-premium (calculate-renewal-premium policy extension-blocks current-age))
+    (new-end-block (+ (get end-block policy) extension-blocks))
+    (grace-period u1440)
+  )
+    (asserts! (is-eq (get holder policy) tx-sender) err-owner-only)
+    (asserts! (get renewable policy) err-policy-not-renewable)
+    (asserts! (get active policy) err-invalid-policy)
+    (asserts! (<= (get renewal-count policy) u5) err-policy-not-renewable)
+    (asserts! (>= stacks-block-height (- (get end-block policy) grace-period)) err-renewal-too-early)
+    (asserts! (and (>= extension-blocks u144) (<= extension-blocks u52560)) err-invalid-duration)
+    (try! (stx-transfer? renewal-premium tx-sender (as-contract tx-sender)))
+    (map-set policies
+      { policy-id: policy-id }
+      (merge policy {
+        end-block: new-end-block,
+        premium: (+ (get premium policy) renewal-premium),
+        renewal-count: (+ (get renewal-count policy) u1)
+      })
+    )
+    (var-set contract-balance (+ (var-get contract-balance) renewal-premium))
+    (ok new-end-block)
+  )
+)
+
+(define-read-only (calculate-renewal-premium (policy {holder: principal, premium: uint, coverage: uint, start-block: uint, end-block: uint, active: bool, age: uint, risk-score: uint, renewable: bool, renewal-count: uint}) (extension-blocks uint) (current-age uint))
+  (let (
+    (base-premium (/ (* (get coverage policy) extension-blocks) u525600))
+    (loyalty-discount (if (>= (get renewal-count policy) u3) u90 u95))
+    (age-adjustment (if (> current-age u65) u110 u100))
+  )
+    (/ (* (* base-premium loyalty-discount) age-adjustment) u10000)
+  )
+)
+
+(define-read-only (get-renewal-eligibility (policy-id uint))
+  (match (map-get? policies { policy-id: policy-id })
+    policy (let (
+      (grace-period u1440)
+      (blocks-until-expiry (- (get end-block policy) stacks-block-height))
+    )
+      (some {
+        renewable: (get renewable policy),
+        active: (get active policy),
+        within-grace-period: (<= blocks-until-expiry grace-period),
+        renewals-remaining: (- u5 (get renewal-count policy)),
+        blocks-until-expiry: blocks-until-expiry
+      })
+    )
+    none
+  )
+)
+
+(define-read-only (estimate-renewal-cost (policy-id uint) (extension-blocks uint))
+  (match (map-get? policies { policy-id: policy-id })
+    policy (let (
+      (current-age (+ (get age policy) (/ (- stacks-block-height (get start-block policy)) u52560)))
+    )
+      (some (calculate-renewal-premium policy extension-blocks current-age))
+    )
+    none
+  )
+)
+
+(define-read-only (get-policy-renewal-history (policy-id uint))
+  (match (map-get? policies { policy-id: policy-id })
+    policy (some {
+      renewal-count: (get renewal-count policy),
+      total-premium-paid: (get premium policy),
+      original-end-block: (+ (get start-block policy) u52560),
+      current-end-block: (get end-block policy)
+    })
+    none
   )
 )
