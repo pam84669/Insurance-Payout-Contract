@@ -12,6 +12,10 @@
 (define-constant err-invalid-duration (err u110))
 (define-constant err-policy-not-renewable (err u111))
 (define-constant err-renewal-too-early (err u112))
+(define-constant err-invalid-beneficiary (err u113))
+(define-constant err-unauthorized-beneficiary (err u114))
+(define-constant err-invalid-percentage (err u115))
+(define-constant err-beneficiaries-full (err u116))
 
 (define-map policies
   { policy-id: uint }
@@ -39,6 +43,15 @@
     status: (string-ascii 20),
     submitted-block: uint,
     approved-block: (optional uint)
+  }
+)
+
+(define-map beneficiaries
+  { policy-id: uint, beneficiary: principal }
+  {
+    percentage: uint,
+    active: bool,
+    added-block: uint
   }
 )
 
@@ -343,6 +356,110 @@
       original-end-block: (+ (get start-block policy) u52560),
       current-end-block: (get end-block policy)
     })
+    none
+  )
+)
+
+(define-public (set-beneficiary (policy-id uint) (beneficiary principal) (percentage uint))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (current-total (get-beneficiary-total-percentage policy-id))
+    (existing-beneficiary (map-get? beneficiaries { policy-id: policy-id, beneficiary: beneficiary }))
+  )
+    (asserts! (is-eq (get holder policy) tx-sender) err-owner-only)
+    (asserts! (get active policy) err-invalid-policy)
+    (asserts! (> percentage u0) err-invalid-percentage)
+    (asserts! (<= percentage u100) err-invalid-percentage)
+    (asserts! (is-none existing-beneficiary) err-already-exists)
+    (asserts! (<= (+ current-total percentage) u100) err-invalid-percentage)
+    (map-set beneficiaries
+      { policy-id: policy-id, beneficiary: beneficiary }
+      {
+        percentage: percentage,
+        active: true,
+        added-block: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-beneficiary-percentage (policy-id uint) (beneficiary principal) (new-percentage uint))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (beneficiary-info (unwrap! (map-get? beneficiaries { policy-id: policy-id, beneficiary: beneficiary }) err-not-found))
+    (current-total (get-beneficiary-total-percentage policy-id))
+    (adjusted-total (- current-total (get percentage beneficiary-info)))
+  )
+    (asserts! (is-eq (get holder policy) tx-sender) err-owner-only)
+    (asserts! (get active beneficiary-info) err-invalid-beneficiary)
+    (asserts! (> new-percentage u0) err-invalid-percentage)
+    (asserts! (<= new-percentage u100) err-invalid-percentage)
+    (asserts! (<= (+ adjusted-total new-percentage) u100) err-invalid-percentage)
+    (map-set beneficiaries
+      { policy-id: policy-id, beneficiary: beneficiary }
+      (merge beneficiary-info { percentage: new-percentage })
+    )
+    (ok true)
+  )
+)
+
+(define-public (remove-beneficiary (policy-id uint) (beneficiary principal))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (beneficiary-info (unwrap! (map-get? beneficiaries { policy-id: policy-id, beneficiary: beneficiary }) err-not-found))
+  )
+    (asserts! (is-eq (get holder policy) tx-sender) err-owner-only)
+    (asserts! (get active beneficiary-info) err-invalid-beneficiary)
+    (map-set beneficiaries
+      { policy-id: policy-id, beneficiary: beneficiary }
+      (merge beneficiary-info { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (beneficiary-claim (policy-id uint) (claim-id uint))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (claim (unwrap! (map-get? claims { claim-id: claim-id }) err-not-found))
+    (beneficiary-info (unwrap! (map-get? beneficiaries { policy-id: policy-id, beneficiary: tx-sender }) err-not-found))
+    (payout-amount (get amount claim))
+    (beneficiary-share (/ (* payout-amount (get percentage beneficiary-info)) u100))
+  )
+    (asserts! (is-eq (get policy-id claim) policy-id) err-invalid-policy)
+    (asserts! (is-eq (get status claim) "approved") err-claim-not-approved)
+    (asserts! (get active beneficiary-info) err-unauthorized-beneficiary)
+    (asserts! (get active policy) err-invalid-policy)
+    (asserts! (>= (var-get contract-balance) beneficiary-share) err-insufficient-funds)
+    (try! (as-contract (stx-transfer? beneficiary-share tx-sender tx-sender)))
+    (var-set contract-balance (- (var-get contract-balance) beneficiary-share))
+    (ok beneficiary-share)
+  )
+)
+
+(define-read-only (get-beneficiary-total-percentage (policy-id uint))
+  u0
+)
+
+(define-read-only (get-beneficiary-info (policy-id uint) (beneficiary principal))
+  (map-get? beneficiaries { policy-id: policy-id, beneficiary: beneficiary })
+)
+
+(define-read-only (is-authorized-beneficiary (policy-id uint) (beneficiary principal))
+  (match (map-get? beneficiaries { policy-id: policy-id, beneficiary: beneficiary })
+    beneficiary-info (get active beneficiary-info)
+    false
+  )
+)
+
+(define-read-only (calculate-beneficiary-payout (policy-id uint) (beneficiary principal) (total-amount uint))
+  (match (map-get? beneficiaries { policy-id: policy-id, beneficiary: beneficiary })
+    beneficiary-info 
+      (if (get active beneficiary-info)
+        (some (/ (* total-amount (get percentage beneficiary-info)) u100))
+        none
+      )
     none
   )
 )
