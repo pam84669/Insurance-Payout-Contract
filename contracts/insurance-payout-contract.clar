@@ -16,6 +16,8 @@
 (define-constant err-unauthorized-beneficiary (err u114))
 (define-constant err-invalid-percentage (err u115))
 (define-constant err-beneficiaries-full (err u116))
+(define-constant err-coverage-exceeded (err u117))
+(define-constant err-no-coverage-remaining (err u118))
 
 (define-map policies
   { policy-id: uint }
@@ -29,7 +31,9 @@
     age: uint,
     risk-score: uint,
     renewable: bool,
-    renewal-count: uint
+    renewal-count: uint,
+    total-claimed: uint,
+    claim-count: uint
   }
 )
 
@@ -83,7 +87,9 @@
         age: age,
         risk-score: risk-score,
         renewable: true,
-        renewal-count: u0
+        renewal-count: u0,
+        total-claimed: u0,
+        claim-count: u0
       }
     )
     (var-set contract-balance (+ (var-get contract-balance) premium))
@@ -96,11 +102,13 @@
   (let (
     (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
     (claim-id (var-get next-claim-id))
+    (remaining-coverage (- (get coverage policy) (get total-claimed policy)))
   )
     (asserts! (is-eq (get holder policy) tx-sender) err-owner-only)
     (asserts! (get active policy) err-invalid-policy)
     (asserts! (<= stacks-block-height (get end-block policy)) err-policy-expired)
-    (asserts! (<= amount (get coverage policy)) err-invalid-amount)
+    (asserts! (> remaining-coverage u0) err-no-coverage-remaining)
+    (asserts! (<= amount remaining-coverage) err-coverage-exceeded)
     (asserts! (> amount u0) err-invalid-amount)
     (map-set claims
       { claim-id: claim-id }
@@ -158,6 +166,9 @@
     (claim (unwrap! (map-get? claims { claim-id: claim-id }) err-not-found))
     (policy (unwrap! (map-get? policies { policy-id: (get policy-id claim) }) err-not-found))
     (payout-amount (get amount claim))
+    (new-total-claimed (+ (get total-claimed policy) payout-amount))
+    (new-claim-count (+ (get claim-count policy) u1))
+    (coverage-exhausted (>= new-total-claimed (get coverage policy)))
   )
     (asserts! (is-eq (get status claim) "approved") err-claim-not-approved)
     (asserts! (>= (var-get contract-balance) payout-amount) err-insufficient-funds)
@@ -168,7 +179,12 @@
     )
     (map-set policies
       { policy-id: (get policy-id claim) }
-      (merge policy { active: false, renewable: false })
+      (merge policy { 
+        total-claimed: new-total-claimed,
+        claim-count: new-claim-count,
+        active: (not coverage-exhausted),
+        renewable: (if coverage-exhausted false (get renewable policy))
+      })
     )
     (var-set contract-balance (- (var-get contract-balance) payout-amount))
     (ok payout-amount)
@@ -309,7 +325,7 @@
   )
 )
 
-(define-read-only (calculate-renewal-premium (policy {holder: principal, premium: uint, coverage: uint, start-block: uint, end-block: uint, active: bool, age: uint, risk-score: uint, renewable: bool, renewal-count: uint}) (extension-blocks uint) (current-age uint))
+(define-read-only (calculate-renewal-premium (policy {holder: principal, premium: uint, coverage: uint, start-block: uint, end-block: uint, active: bool, age: uint, risk-score: uint, renewable: bool, renewal-count: uint, total-claimed: uint, claim-count: uint}) (extension-blocks uint) (current-age uint))
   (let (
     (base-premium (/ (* (get coverage policy) extension-blocks) u525600))
     (loyalty-discount (if (>= (get renewal-count policy) u3) u90 u95))
@@ -460,6 +476,50 @@
         (some (/ (* total-amount (get percentage beneficiary-info)) u100))
         none
       )
+    none
+  )
+)
+
+(define-read-only (get-remaining-coverage (policy-id uint))
+  (match (map-get? policies { policy-id: policy-id })
+    policy (some (- (get coverage policy) (get total-claimed policy)))
+    none
+  )
+)
+
+(define-read-only (get-policy-claim-history (policy-id uint))
+  (match (map-get? policies { policy-id: policy-id })
+    policy (some {
+      total-coverage: (get coverage policy),
+      total-claimed: (get total-claimed policy),
+      remaining-coverage: (- (get coverage policy) (get total-claimed policy)),
+      claim-count: (get claim-count policy),
+      coverage-exhausted: (>= (get total-claimed policy) (get coverage policy))
+    })
+    none
+  )
+)
+
+(define-read-only (can-submit-claim (policy-id uint) (amount uint))
+  (match (map-get? policies { policy-id: policy-id })
+    policy (let (
+      (remaining-coverage (- (get coverage policy) (get total-claimed policy)))
+    )
+      (and
+        (get active policy)
+        (<= stacks-block-height (get end-block policy))
+        (> remaining-coverage u0)
+        (<= amount remaining-coverage)
+        (> amount u0)
+      )
+    )
+    false
+  )
+)
+
+(define-read-only (get-coverage-utilization (policy-id uint))
+  (match (map-get? policies { policy-id: policy-id })
+    policy (some (/ (* (get total-claimed policy) u100) (get coverage policy)))
     none
   )
 )
